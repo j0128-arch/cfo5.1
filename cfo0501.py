@@ -17,6 +17,17 @@ st.set_page_config(
 warnings.filterwarnings('ignore')
 
 # ============================================
+# 0. 安全設定 (Secrets Management)
+# ============================================
+# 嘗試從 Streamlit Secrets 讀取 API Key
+if 'FRED_API_KEY' in st.secrets:
+    FRED_API_KEY = st.secrets['FRED_API_KEY']
+else:
+    st.error("🚨 未偵測到 API Key！請在 Streamlit 的 Secrets 管理中設定 'FRED_API_KEY'。")
+    st.info("💡 本地端請建立 .streamlit/secrets.toml，雲端請至 App Settings -> Secrets 設定。")
+    st.stop() # 停止執行後續程式
+
+# ============================================
 # 1. 側邊欄參數設定 (UI 介面)
 # ============================================
 st.sidebar.header("⚙️ 參數設定")
@@ -35,9 +46,6 @@ END_DATE = st.sidebar.date_input("📅 回測結束日期", default_end)
 INITIAL_CAPITAL = st.sidebar.number_input("💰 初始本金", value=100000, step=10000)
 MONTHLY_CONTRIBUTION = st.sidebar.number_input("💵 每月投入", value=1000, step=100)
 
-# API Key
-FRED_API_KEY = st.sidebar.text_input("🔑 FRED API Key", value="9382c202c6133484efb2c1cb571495af", type="password")
-
 st.sidebar.markdown("---")
 run_btn = st.sidebar.button("🚀 開始回測", type="primary")
 
@@ -51,8 +59,6 @@ class CFO_Battle_Engine:
         self.api_key = api_key
         self.initial_capital = initial_capital
         self.monthly_contribution = monthly_contribution
-        self.data = None
-        self.dataset = None
         self.strategies = [
             'DCA', 
             'Pure_MA200', 
@@ -73,7 +79,6 @@ class CFO_Battle_Engine:
 
     def calculate_kelly_simple(self, price_series, current_date, rf_rate):
         window = 60
-        # 取得直到今天的過去數據
         past_data = price_series.loc[:current_date].tail(window+1)
         if len(past_data) < window: return 0.0
         
@@ -86,21 +91,16 @@ class CFO_Battle_Engine:
 
         if var == 0: return 0.0
         f = (mu - hurdle) / var
-        # Half-Kelly + Cap at 1.0
         return max(0.0, min(f * 0.5, 1.0))
 
     def run_backtest(self, dataset, start_date, end_date):
-        # 篩選回測期間
         mask_date = pd.to_datetime(start_date)
         end_date_dt = pd.to_datetime(end_date)
         df = dataset.loc[(dataset.index >= mask_date) & (dataset.index <= end_date_dt)].copy()
         
-        if df.empty:
-            return pd.DataFrame()
+        if df.empty: return pd.DataFrame()
 
-        # 計算 RSI
         df['RSI'] = self.calculate_rsi(df['PRICE'])
-
         monthly_dates = df.resample('MS').first().index
         history = []
         
@@ -139,22 +139,16 @@ class CFO_Battle_Engine:
             target_weights = {s: 0.0 for s in self.strategies}
             is_bull = price > ma200
             
-            # A. DCA
             target_weights['DCA'] = 1.0
-            
-            # B. Pure MA200
             target_weights['Pure_MA200'] = 1.0 if is_bull else 0.0
             
-            # 基礎 Kelly 值
             base_kelly = self.calculate_kelly_simple(dataset['PRICE'], d, rf)
 
-            # C. CFO 9.0 (CashMaster)
             k9 = base_kelly
             if is_bull and k9 < 0.3: k9 = 0.3
             if not is_bull: k9 = 0.0
             target_weights['CFO_9.0_CashMaster'] = k9
 
-            # D. CFO 5.1 (Macro-Kelly)
             macro_score = 0
             if liq > liq_ma: macro_score += 1
             if gsr < gsr_ma: macro_score += 1
@@ -193,60 +187,44 @@ class CFO_Battle_Engine:
 
         return pd.DataFrame(history).set_index('Date')
 
-# 使用 Streamlit Cache 機制，避免每次都要重新下載數據
+# 使用 Cache，避免重複下載
 @st.cache_data(ttl=3600)
 def get_market_data(ticker, start_date, end_date, api_key):
     download_start = (pd.to_datetime(start_date) - timedelta(days=400)).strftime('%Y-%m-%d')
     end_str = end_date.strftime('%Y-%m-%d')
     
-    # 1. 下載 Yahoo 數據
+    # 1. Yahoo Data
     yf_tickers = [ticker, 'GC=F', 'SI=F', 'HG=F']
     try:
         df = yf.download(yf_tickers, start=download_start, end=end_str, progress=False)
-        
         if isinstance(df.columns, pd.MultiIndex):
-            try: 
-                df_close = df.xs('Close', axis=1, level=0)
-            except:
-                df_close = df.iloc[:, :len(yf_tickers)]
-                df_close.columns = yf_tickers
+            try: df_close = df.xs('Close', axis=1, level=0)
+            except: df_close = df.iloc[:, :len(yf_tickers)]; df_close.columns = yf_tickers
         else:
             df_close = df[['Close']] if 'Close' in df.columns else df
 
-        if len(yf_tickers) == 1:
-            data = pd.DataFrame(df_close); data.columns = [ticker]
-        else:
-            data = df_close
+        if len(yf_tickers) == 1: data = pd.DataFrame(df_close); data.columns = [ticker]
+        else: data = df_close
 
         mapper = {'GC=F': 'GOLD', 'SI=F': 'SILVER', 'HG=F': 'COPPER', ticker: 'PRICE'}
-        data = data.rename(columns=mapper)
-        data = data.ffill().bfill()
+        data = data.rename(columns=mapper).ffill().bfill()
         data.index = data.index.tz_localize(None)
     except Exception as e:
         return None, f"Yahoo 下載失敗: {str(e)}"
 
-    # 2. 下載 FRED 數據
+    # 2. FRED Data
     try:
-        fred_syms = {
-            'VIXCLS': 'VIX',
-            'DGS10': 'TNX',
-            'DTB3': 'RISK_FREE_RATE',
-            'WALCL': 'FED_LIQUIDITY'
-        }
+        fred_syms = {'VIXCLS': 'VIX', 'DGS10': 'TNX', 'DTB3': 'RISK_FREE_RATE', 'WALCL': 'FED_LIQUIDITY'}
         fred_df = web.DataReader(list(fred_syms.keys()), 'fred', download_start, end_str, api_key=api_key)
         fred_df = fred_df.rename(columns=fred_syms)
         fred_df['RISK_FREE_RATE'] = fred_df['RISK_FREE_RATE'] / 100
         fred_df = fred_df.ffill().bfill()
         fred_df.index = fred_df.index.tz_localize(None)
     except Exception as e:
-        # Fallback 假資料
-        fred_df = pd.DataFrame(index=data.index)
-        for col in ['VIX', 'TNX', 'RISK_FREE_RATE', 'FED_LIQUIDITY']:
-            fred_df[col] = 0
-        fred_df['RISK_FREE_RATE'] = 0.04
-        st.warning(f"⚠️ FRED 數據下載失敗 ({str(e)})，將使用模擬數據運行。")
+        st.warning(f"⚠️ FRED 數據下載失敗 ({str(e)})")
+        return None, f"FRED Error: {str(e)}"
 
-    # 3. 合併與計算
+    # 3. Merge
     full_df = data.join(fred_df, how='left').ffill().bfill()
     full_df['GOLD_SILVER_RATIO'] = full_df['GOLD'] / full_df['SILVER']
     full_df['GSR_MA200'] = full_df['GOLD_SILVER_RATIO'].rolling(200).mean()
@@ -260,86 +238,58 @@ def get_market_data(ticker, start_date, end_date, api_key):
 # 3. 主程式邏輯
 # ============================================
 
-st.title("⚔️ 終極大亂鬥: CFO 5.1 (混合數據源穩健版)")
-st.markdown("""
-本系統結合 **Yahoo Finance** 與 **FRED 總經數據**，進行多策略回測。
-核心策略包含 `DCA`, `Pure MA200`, `CFO 9.0 CashMaster`, 以及 `CFO 5.1 MacroKelly`。
-""")
+st.title("⚔️ 終極大亂鬥: CFO 5.1 (混合數據源)")
+st.markdown("---")
 
 if run_btn:
-    with st.spinner('📥 正在抓取數據並進行模擬戰鬥...'):
-        # 1. 獲取數據
+    with st.spinner('📥 數據下載與計算中...'):
         dataset, error_msg = get_market_data(TARGET_TICKER, START_DATE, END_DATE, FRED_API_KEY)
         
-        if error_msg:
-            st.error(error_msg)
-        elif dataset is None or dataset.empty:
-            st.error("❌ 無法獲取數據，請檢查標的代碼或日期。")
+        if error_msg or dataset is None or dataset.empty:
+            st.error(f"❌ 錯誤: {error_msg}")
         else:
-            st.success(f"✅ 數據下載成功 (包含 {len(dataset)} 筆交易日資料)")
+            st.success(f"✅ 數據取得成功")
             
-            # 2. 初始化引擎與回測
             eng = CFO_Battle_Engine(TARGET_TICKER, FRED_API_KEY, INITIAL_CAPITAL, MONTHLY_CONTRIBUTION)
-            eng.dataset = dataset # 注入數據
             res = eng.run_backtest(dataset, START_DATE, END_DATE)
 
             if not res.empty:
-                # 3. 繪圖
-                st.subheader("📈 策略淨值走勢圖 (Log Scale)")
+                # 圖表
+                st.subheader("📈 淨值走勢 (Log Scale)")
                 fig, ax = plt.subplots(figsize=(12, 6))
                 plt.style.use('dark_background')
                 colors = ['gray', 'cyan', 'yellow', '#FF00FF']
-                
                 for i, s in enumerate(eng.strategies):
                     lw = 2.5 if 'CFO' in s else 1
                     ax.plot(res.index, res[s], label=s, color=colors[i], linewidth=lw)
-                
-                ax.set_title(f'Strategy Battle: {TARGET_TICKER}', fontsize=14, color='white')
                 ax.legend()
                 ax.set_yscale('log')
                 ax.grid(True, alpha=0.2)
                 st.pyplot(fig)
 
-                # 4. 統計報表
-                st.subheader("🏆 最終戰績結算")
-                
-                final_day = res.index[-1]
-                last_price = dataset.loc[final_day, 'PRICE']
+                # 報表
+                st.subheader("🏆 戰績結算")
+                final_vals = res.iloc[-1].sort_values(ascending=False)
                 days = (res.index[-1] - res.index[0]).days
                 years = max(days / 365.0, 0.1)
+                last_price = dataset.loc[res.index[-1], 'PRICE']
 
                 stats_data = []
-                final_vals = res.iloc[-1].sort_values(ascending=False)
-
                 for strat, val in final_vals.items():
                     if strat == 'Date': continue
-                    
-                    # CAGR 計算
                     ret = val / eng.total_invested
                     cagr = (ret ** (1/years)) - 1
-                    
-                    # 持倉佔比
                     pos_val = eng.holdings[strat] * last_price
-                    cash_val = eng.cash[strat]
-                    total = pos_val + cash_val
-                    ratio = (pos_val / total) * 100 if total > 0 else 0
-                    
-                    intr = eng.interest_earned[strat]
+                    ratio = (pos_val / (pos_val + eng.cash[strat])) * 100
                     
                     stats_data.append({
                         "Strategy": strat,
                         "Final Balance": f"${val:,.0f}",
                         "CAGR": f"{cagr*100:.1f}%",
-                        "Crypto %": f"{ratio:.0f}%",
-                        "Cash %": f"{100-ratio:.0f}%",
-                        "Interest Earned": f"${intr:,.0f}"
+                        "Risk Asset %": f"{ratio:.0f}%",
+                        "Interest": f"${eng.interest_earned[strat]:,.0f}"
                     })
-
-                st.write(f"💰 **總投入本金**: ${eng.total_invested:,.0f}")
                 
-                # 顯示漂亮的 DataFrame 表格
-                df_stats = pd.DataFrame(stats_data)
-                st.dataframe(df_stats, use_container_width=True)
-
+                st.dataframe(pd.DataFrame(stats_data), use_container_width=True)
             else:
-                st.warning("❌ 回測結果為空，請檢查日期範圍是否包含交易日。")
+                st.warning("無回測結果，請檢查日期範圍。")
